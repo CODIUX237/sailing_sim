@@ -38,7 +38,8 @@ class SailingBoat:
     """
     Gestisce la fisica, la posizione e l'attrito (drag) della barca.
     """
-    def __init__(self, x, y, heading, max_speed=40.0):
+    def __init__(self, boat_id,  x, y, heading, max_speed=40.0):
+        self.id = boat_id #per distinguere le barche
         self.x = x
         self.y = y
         self.heading = heading
@@ -104,3 +105,41 @@ class SailingBoat:
         displacement = self.speed * dt
         self.x += displacement * np.cos(self.heading)
         self.y += displacement * np.sin(self.heading)
+
+def calculate_wind_shadow(boat1, boat2, wind_speed_1, wind_speed_2, wind_dir):
+    """
+     Calcola l'interferenza del vento tra due barche.
+    Restituisce le nuove velocità del vento tenendo conto del cono d'ombra.
+    """
+    dx = boat2.x - boat1.x
+    dy = boat2.y - boat1.y
+    dist = np.hypot(dx, dy)
+        
+    # Se sono a più di 100 metri, nessuna interferenza
+    if dist > 100.0:
+        return wind_speed_1, wind_speed_2
+            
+    angle_1_to_2 = np.arctan2(dy, dx)
+    angle_2_to_1 = np.arctan2(-dy, -dx)
+        
+    # Calcoliamo verso dove SOFFIA il vento (wind_dir è da dove arriva)
+    wind_down_angle = (wind_dir + np.pi) % (2 * np.pi) - np.pi
+        
+    # Ampiezza del cono d'ombra (es. 20 gradi a destra e sinistra)
+    cone_angle = np.radians(20) 
+        
+    # Calcoliamo se una barca è allineata con il vento rispetto all'altra
+    diff_angle_1 = abs((angle_1_to_2 - wind_down_angle + np.pi) % (2 * np.pi) - np.pi)
+    diff_angle_2 = abs((angle_2_to_1 - wind_down_angle + np.pi) % (2 * np.pi) - np.pi)
+        
+    # Più le barche sono vicine, più i "rifiuti" sono forti (max 40% di perdita)
+    shadow_factor = max(0.0, 1.0 - (dist / 100.0)) * 0.4 
+        
+    if diff_angle_1 < cone_angle:
+        # Barca 1 è sopravento: copre la Barca 2
+        wind_speed_2 *= (1.0 - shadow_factor)
+    elif diff_angle_2 < cone_angle:
+        # Barca 2 è sopravento: copre la Barca 1
+        wind_speed_1 *= (1.0 - shadow_factor)
+            
+    return wind_speed_1, wind_speed_2

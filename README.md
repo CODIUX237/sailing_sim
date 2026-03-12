@@ -1,60 +1,88 @@
----
+```markdown
+# ⛵ America's Cup 2D - Multi-Agent RL Simulator
 
-# ⛵ Sailing Simulator - America's Cup RL
+Un simulatore 2D avanzato di regata velica basato sulle regole della Coppa America. Il progetto utilizza **Multi-Agent Reinforcement Learning (MARL)** per addestrare due barche (agenti) a competere in un Match Race utilizzando algoritmi allo stato dell'arte (PPO via Stable-Baselines3) e la libreria PettingZoo.
 
-Questo progetto è un simulatore di regata tattica basato su **Reinforcement Learning**. L'obiettivo è addestrare un agente (la barca) a navigare tra le boe nel minor tempo possibile, gestendo la fisica del vento e il decollo sui **foil**.
+## ✨ Features Principali
 
-## 🛠️ Requisiti di Sistema
-
-Prima di iniziare, assicurati di avere installato:
-
-* **Python 3.8+** (Consigliato 3.10 o 3.11 per massima compatibilità con le librerie RL).
-* **FFMPEG**: Necessario per la generazione dei video `.mp4`.
-
-## 📦 Installazione delle Dipendenze
-
-Apri il terminale nella cartella del progetto ed esegui i seguenti comandi per installare tutti i componenti necessari:
-
-```bash
-# 1. Core Reinforcement Learning & Ambiente
-pip install gymnasium stable-baselines3 shimmy
-
-# 2. Matematica e Grafica
-pip install numpy matplotlib
-
-# 3. Generazione Video e Codec (Fondamentale!)
-pip install imageio imageio[ffmpeg]
-
-```
+* **Fisica del Foiling:** Le barche possono alzare i foil per aumentare drasticamente la velocità, ma rischiano lo stallo se la velocità scende sotto la soglia critica.
+* **Vento Stocastico (Random Walk):** Il campo di regata è diviso in una griglia vettoriale. Il vento cambia intensità e direzione nel tempo e nello spazio (raffiche).
+* **Wind Shadow (Copertura del vento):** Modello tattico integrato. Se una barca si posiziona sopravento all'avversario, crea un "cono d'ombra" che riduce il vento (e la velocità) della barca inseguitrice.
+* **Regole di Precedenza (Right of Way):** Arbitro automatico che calcola le Mure a Dritta/Sinistra (Starboard/Port) e Sottovento/Sopravento, assegnando penalità (Reward Shaping) in caso di infrazione.
+* **Self-Play Training:** L'agente si allena combattendo contro le versioni precedenti di se stesso, imparando autonomamente tattiche di Match Race sempre più complesse.
 
 ## 📂 Struttura del Progetto
 
-* `main.py`: Il punto di ingresso. Gestisce l'addestramento (`train`), il test (`test`) e la registrazione (`video`).
-* `environment.py`: Contiene la logica dell'ambiente Gymnasium (`SailingEnv`).
-* `physics.py`: Gestisce i calcoli vettoriali del vento e la dinamica della barca.
-* `render.py`: Motore grafico basato su Matplotlib per disegnare i frame della regata.
-* `models/`: Cartella dove vengono salvati i modelli addestrati (file `.zip`).
+Il codice è modulare e diviso per responsabilità:
 
-## 🚀 Come Eseguire il Codice
+* `physics.py`: Motore fisico. Gestisce il drag, l'accelerazione, il foiling, la griglia del vento e il calcolo del cono d'ombra (Wind Shadow).
+* `rules.py`: Motore logico ("Arbitro"). Calcola le mure e le precedenze tramite geometria vettoriale.
+* `environment.py`: L'ambiente Gymnasium/PettingZoo (`AmericasCupMultiEnv`). Gestisce i reward, le penalità, i boundary del campo e i gate.
+* `render.py`: Motore grafico basato su Matplotlib. Genera i frame per la visualizzazione.
+* `main.py`: Entry point. Gestisce il training PPO con il Self-Play Wrapper e la generazione dei video.
 
-Puoi cambiare la modalità di esecuzione modificando la variabile `MODE` all'interno del file `main.py`:
+## 🚀 Installazione
 
-1. **Training**: Per iniziare ad addestrare l'IA da zero.
-* Imposta `MODE = "train"`
-* Esegui: `python main.py`
+Assicurati di avere Python 3.9+ installato. Crea un ambiente virtuale e installa le dipendenze:
 
+```bash
+pip install gymnasium pettingzoo stable-baselines3 numpy matplotlib imageio imageio[ffmpeg]
 
-2. **Video**: Per caricare un modello esistente e generare un video `.mp4` della regata.
-* Imposta `MODE = "video"`
-* Esegui: `python main.py`
-* Il file verrà salvato come `sailing_sim.mp4`.
+```
 
+## 🎮 Utilizzo
 
+Tutta l'esecuzione è gestita tramite il file `main.py`. Apri il file e modifica la variabile `MODE` in fondo allo script:
 
-## ⚠️ Risoluzione Problemi Comuni
+### 1. Addestramento (Training)
 
-* **Errore Video (Backend)**: Se ricevi un errore "Could not find a backend", assicurati di aver lanciato `pip install imageio[ffmpeg]`.
-* **Errore Reshape (2560000)**: Se il codice crasha durante il rendering, assicurati che in `render.py` la conversione dell'immagine gestisca i 4 canali (RGBA) prima di convertirli in RGB.
-* **Warning Gymnasium**: I warning relativi alla precisione dei `Box` (float64 to float32) sono normali e non bloccano l'esecuzione.
+Imposta `MODE = "train"` ed esegui lo script:
+
+```bash
+python main.py
+
+```
+
+Il modello inizierà ad addestrarsi. Al primo avvio, `boat_0` giocherà contro un avversario casuale. Ai riavvii successivi, caricherà l'ultimo modello salvato in `models/ppo_match_race.zip` e farà **Self-Play**, alzando il livello della sfida.
+
+### 2. Generazione Video (Test)
+
+Imposta `MODE = "video"` ed esegui lo script:
+
+```bash
+python main.py
+
+```
+
+Le due reti neurali si sfideranno in regata. Al termine, troverai il file `match_race.mp4` nella root del progetto.
 
 ---
+
+## 🛠️ Troubleshooting: Il Problema del Reshape (Matplotlib)
+
+A seconda del tuo sistema operativo o della risoluzione del monitor (DPI scaling), potresti incontrare un errore durante la generazione del video (quando `render.py` cerca di fare il reshape dell'immagine):
+`ValueError: cannot reshape array of size X into shape (Y, Z, 3)`.
+
+**La Soluzione:**
+Apri il file `render.py`, vai in fondo alla funzione `render_frame`, elimina le ultime tre righe del canvas e sostituiscile con questo blocco di codice robusto:
+
+```python
+    # Converti il canvas in RGB array (Versione anti-crash per DPI)
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+    # Usiamo buffer_rgba invece di tostring_rgb (che è deprecato)
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    # Reshape dinamico basato sulle dimensioni REALI del buffer calcolato dal sistema
+    image = buf.reshape((h, w, 4))
+    # Rimuoviamo il canale Alpha (trasparenza) per tenere solo R, G, B
+    image = image[:, :, :3]
+    
+    return image
+
+```
+
+Questo garantisce che le dimensioni calcolate per il video `.mp4` corrispondano sempre perfettamente alla griglia dei pixel generata da Matplotlib, indipendentemente dal tuo OS.
+
+## 🤝 Contribuire
+
+Ogni Pull Request è benvenuta. Se vuoi migliorare le funzioni polari in `physics.py` o aggiungere il rendering del timer di pre-partenza, sentiti libero di aprire una issue!

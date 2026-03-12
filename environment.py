@@ -1,171 +1,198 @@
+import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-import numpy as np
-from render import render_frame
+from pettingzoo import ParallelEnv
 
-# Importiamo i moduli che abbiamo creato prima
-from physics import WindField, SailingBoat
+# Importiamo i nostri moduli di fisica e regole
+from physics import WindField, SailingBoat, calculate_wind_shadow
+from rules import check_penalties
 
-class AmericaCupEnv(gym.Env):
+class AmericasCupMultiEnv(ParallelEnv):
     """
-    Ambiente Custom Gymnasium per la Coppa America.
-    Gestisce le regole, i gate, il timer di pre-partenza e il sistema di reward.
+    Ambiente Multi-Agente per il Match Race della Coppa America.
+    Supporta 2 barche che competono applicando regole di precedenza e wind shadow.
     """
+    metadata = {"render_modes": ["rgb_array"], "name": "americas_cup_marl_v1"}
+
     def __init__(self, render_mode=None):
         super().__init__()
+        self.render_mode = render_mode
         
-        # Configurazioni di base
+        # Definiamo gli agenti
+        self.possible_agents = ["boat_0", "boat_1"]
+        self.agents = self.possible_agents.copy()
+        
         self.field_size = 500.0
         self.target_radius = 20.0
-        self.dt = 0.5  # Mezzo secondo per step simulato
+        self.dt = 0.5
         self.max_steps = 1000
         
-        # --- SPAZIO DELLE AZIONI (CONTINUO) ---
-        # action[0]: Timone da -1.0 (tutta sinistra) a 1.0 (tutta destra)
-        # action[1]: Foil da 0.0 (giù) a 1.0 (su, se > 0.5 vuole volare)
-        self.action_space = spaces.Box(
-            low=np.array([-1.0, 0.0]), 
-            high=np.array([1.0, 1.0]), 
-            dtype=np.float32
-        )
+        # Dizionari per spazi di azione e osservazione
+        self.action_spaces = {}
+        self.observation_spaces = {}
         
-        # --- SPAZIO DELLE OSSERVAZIONI ---
-        # Cosa vede l'agente? 
-        # [x, y, heading, speed, foil_attivo, wind_speed, wind_dir, dist_target, angle_target, time_to_start]
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32
-        )
-        
-        # Inizializziamo i componenti
+        for agent in self.possible_agents:
+            # Action: [Timone (-1 a 1), Foil (0 a 1)]
+            self.action_spaces[agent] = spaces.Box(
+                low=np.array([-1.0, 0.0]), 
+                high=np.array([1.0, 1.0]), 
+                dtype=np.float32
+            )
+            
+            # Obs: 13 valori (5 propri + 2 vento + 2 target + 4 nemico)
+            self.observation_spaces[agent] = spaces.Box(
+                low=-np.inf, high=np.inf, shape=(13,), dtype=np.float32
+            )
+            
         self.wind = None
-        self.boat = None
+        self.boats = {}
         self.gates = []
-        self.gate_index = 0
-        self.current_target = None
-        
         self.step_count = 0
-        self.time_to_start = 120.0 # 2 Minuti di pre-partenza
-        
+
     def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
+        self.agents = self.possible_agents.copy()
+        self.step_count = 0
         
-        # 1. Resettiamo il Vento e la Barca
         self.wind = WindField(field_size=self.field_size)
         
-        # Posizioniamo la barca nella zona di pre-partenza (es. in basso al centro)
-        start_x = self.field_size / 2
-        start_y = 50.0
-        self.boat = SailingBoat(x=start_x, y=start_y, heading=np.pi/2)
+        # Posizioniamo le barche separate sulla linea di partenza
+        self.boats = {
+            "boat_0": SailingBoat(boat_id="boat_0", x=self.field_size/2 - 50, y=50.0, heading=np.pi/2),
+            "boat_1": SailingBoat(boat_id="boat_1", x=self.field_size/2 + 50, y=50.0, heading=np.pi/2)
+        }
         
-        # 2. Resettiamo i contatori
-        self.step_count = 0
-        self.time_to_start = 120.0 # Reset timer pre-partenza
-        
-        # 3. Generiamo i Gate (Boe)
-        # Per semplicità ora creiamo un percorso a bastone (su e giù)
+        # Gate a bastone
         gate_up = np.array([self.field_size / 2, self.field_size - 50.0])
         gate_down = np.array([self.field_size / 2, 100.0])
         self.gates = [gate_up, gate_down, gate_up]
-        self.gate_index = 0
-        self.current_target = self.gates[self.gate_index]
         
-        return self._get_obs(), {}
+        # Indici dei gate per ogni barca
+        self.boat_gate_indices = {"boat_0": 0, "boat_1": 0}
+        
+        observations = {agent: self._get_obs(agent) for agent in self.agents}
+        infos = {agent: {} for agent in self.agents}
+        
+        return observations, infos
 
-    def step(self, action):
+    def step(self, actions):
         self.step_count += 1
-        reward = 0.0
-        terminated = False
-        truncated = False
         
-        # --- 1. AGGIORNAMENTO FISICA E VENTO ---
-        # Il vento evolve nel tempo (random walk)
+        rewards = {agent: 0.0 for agent in self.agents}
+        terminations = {agent: False for agent in self.agents}
+        truncations = {agent: False for agent in self.agents}
+        infos = {agent: {} for agent in self.agents}
+        
+        # 1. EVOLUZIONE VENTO
         self.wind.step()
         
-        # Otteniamo il vento specifico nel punto in cui si trova la barca
-        local_wind_speed, local_wind_dir = self.wind.get_wind_at(self.boat.x, self.boat.y)
-        
-        # Muoviamo la barca
-        action_turn = action[0]
-        action_foil = action[1]
-        self.boat.update_physics(self.dt, action_turn, action_foil, local_wind_speed, local_wind_dir)
-        
-        # --- 2. LOGICA PRE-PARTENZA (Regole) ---
-        if self.time_to_start > 0:
-            self.time_to_start -= self.dt
-            # Se la barca supera la linea di partenza (y > 100) prima che il tempo scada (OCS)
-            if self.boat.y > 100.0:
-                reward -= 5.0 # Forte penalità continua per essere partiti in anticipo!
-        
-        # --- 3. BOUNDARY BOX (Confini del campo) ---
-        # Penalità "soft", non terminiamo l'episodio ma togliamo punti
-        if self.boat.x < 0 or self.boat.x > self.field_size or self.boat.y < 0 or self.boat.y > self.field_size:
-            reward -= 10.0
-            # Riportiamo la barca "rimbalzando" dolcemente dentro i confini
-            self.boat.x = np.clip(self.boat.x, 0, self.field_size)
-            self.boat.y = np.clip(self.boat.y, 0, self.field_size)
+        # Vento al centro del campo (utile per le regole generali)
+        _, global_wind_dir = self.wind.get_wind_at(self.field_size/2, self.field_size/2)
 
-        # --- 4. CALCOLO REWARD (VMG) ---
-        pos = np.array([self.boat.x, self.boat.y])
-        dist_to_target = np.linalg.norm(self.current_target - pos)
+        # 2. CALCOLO WIND SHADOW (Fisica condivisa)
+        b0, b1 = self.boats["boat_0"], self.boats["boat_1"]
+        w_speed_0, w_dir_0 = self.wind.get_wind_at(b0.x, b0.y)
+        w_speed_1, w_dir_1 = self.wind.get_wind_at(b1.x, b1.y)
         
-        # Angolo verso il target
-        angle_to_target = np.arctan2(self.current_target[1] - self.boat.y, self.current_target[0] - self.boat.x)
-        
-        # VMG: quanto la barca sta effettivamente andando verso il bersaglio
-        heading_error = abs((angle_to_target - self.boat.heading + np.pi) % (2 * np.pi) - np.pi)
-        vmg_to_target = self.boat.speed * np.cos(heading_error)
-        
-        # Diamo punti solo se il pre-start è finito, altrimenti premia restare in zona
-        if self.time_to_start <= 0:
-            reward += vmg_to_target * 0.1
-        
-            # --- 5. CONTROLLO PASSAGGIO GATE ---
-            if dist_to_target < self.target_radius:
-                reward += 100.0 # Grande premio per aver raggiunto la boa!
-                self.gate_index += 1
+        # Applichiamo i rifiuti prima di muovere le barche
+        w_speed_0, w_speed_1 = calculate_wind_shadow(b0, b1, w_speed_0, w_speed_1, global_wind_dir)
+
+        # 3. AGGIORNAMENTO FISICA SINGOLE BARCHE
+        for agent in self.agents:
+            if agent in actions:
+                action = actions[agent]
+                boat = self.boats[agent]
+                wind_spd = w_speed_0 if agent == "boat_0" else w_speed_1
+                wind_dir = w_dir_0 if agent == "boat_0" else w_dir_1
                 
-                if self.gate_index >= len(self.gates):
-                    terminated = True # Gara finita! Vittoria!
-                    reward += 500.0
-                else:
-                    self.current_target = self.gates[self.gate_index]
+                boat.update_physics(self.dt, action[0], action[1], wind_spd, wind_dir)
+                
+                # Penalità Uscita dal Campo
+                if boat.x < 0 or boat.x > self.field_size or boat.y < 0 or boat.y > self.field_size:
+                    rewards[agent] -= 5.0
+                    boat.x = np.clip(boat.x, 0, self.field_size)
+                    boat.y = np.clip(boat.y, 0, self.field_size)
 
-        # Condizione di fine tempo massimo
-        if self.step_count >= self.max_steps:
-            truncated = True
+        # 4. CONTROLLO REGOLE E COLLISIONI (Arbitro)
+        pen_0, pen_1 = check_penalties(b0, b1, global_wind_dir)
+
+        #applica la penalità solo se la barca è ancora nel dizionnario dei rewards
+        if "boat_0" in rewards:
+            rewards["boat_0"] += pen_0
+        if "boat_1" in rewards:
+            rewards["boat_1"] += pen_1
+
+        # 5. PROGRESSO E VMG (Reward Shaping)
+        for agent in list(rewards.keys()): #usiamo list per evitare errori di iterazioni se eliminiamo agenti
+            boat = self.boats[agent]
+            target = self.gates[self.boat_gate_indices[agent]]
             
-        info = {
-            'speed': self.boat.speed,
-            'distance_to_target': dist_to_target,
-            'time_to_start': max(0, self.time_to_start),
-            'foil_active': self.boat.foil
-        }
-        
-        return self._get_obs(), reward, terminated, truncated, info
+            dist_to_target = np.linalg.norm(target - np.array([boat.x, boat.y]))
+            angle_to_target = np.arctan2(target[1] - boat.y, target[0] - boat.x)
+            
+            # VMG verso la boa
+            heading_error = abs((angle_to_target - boat.heading + np.pi) % (2 * np.pi) - np.pi)
+            vmg = boat.speed * np.cos(heading_error)
+            rewards[agent] += vmg * 0.1
+            
+            # Passaggio Boa
+            if dist_to_target < self.target_radius:
+                rewards[agent] += 50.0
+                self.boat_gate_indices[agent] += 1
+                
+                # Se ha finito il percorso
+                if self.boat_gate_indices[agent] >= len(self.gates):
+                    terminations[agent] = True
+                    rewards[agent] += 200.0 # Premio vittoria
 
-    def _get_obs(self):
-        """Costruisce l'array di osservazione per l'agente."""
-        pos = np.array([self.boat.x, self.boat.y])
-        dist_to_target = np.linalg.norm(self.current_target - pos)
-        angle_to_target = np.arctan2(self.current_target[1] - self.boat.y, self.current_target[0] - self.boat.x)
+        # Condizione di fine tempo (Truncation)
+        if self.step_count >= self.max_steps:
+            for agent in self.agents:
+                truncations[agent] = True
+
+        # Rimuoviamo gli agenti che hanno finito
+        self.agents = [agent for agent in self.agents if not (terminations[agent] or truncations[agent])]
         
-        local_wind_speed, local_wind_dir = self.wind.get_wind_at(self.boat.x, self.boat.y)
+        observations = {agent: self._get_obs(agent) for agent in self.agents}
+        
+        return observations, rewards, terminations, truncations, infos
+
+    def _get_obs(self, agent_id):
+        """Costruisce l'osservazione includendo i dati del nemico."""
+        boat = self.boats[agent_id]
+        enemy_id = "boat_1" if agent_id == "boat_0" else "boat_0"
+        enemy = self.boats[enemy_id]
+        
+        target = self.gates[min(self.boat_gate_indices[agent_id], len(self.gates)-1)]
+        dist_to_target = np.linalg.norm(target - np.array([boat.x, boat.y]))
+        angle_to_target = np.arctan2(target[1] - boat.y, target[0] - boat.x)
+        
+        local_wind_spd, local_wind_dir = self.wind.get_wind_at(boat.x, boat.y)
+        
+        # Calcoliamo posizione relativa del nemico
+        rel_enemy_x = enemy.x - boat.x
+        rel_enemy_y = enemy.y - boat.y
         
         obs = np.array([
-            self.boat.x / self.field_size,         # Normalizzato 0-1
-            self.boat.y / self.field_size,         # Normalizzato 0-1
-            self.boat.heading,                     # In radianti
-            self.boat.speed / 40.0,                # Normalizzato rispetto a max speed
-            1.0 if self.boat.foil else 0.0,        # Stato del foil
-            local_wind_speed / 25.0,               # Vento locale
-            local_wind_dir,                        # Dir vento locale
-            dist_to_target / self.field_size,      # Distanza boa normalizzata
-            angle_to_target,                       # Angolo boa
-            self.time_to_start / 120.0             # Timer partenza normalizzato
+            boat.x / self.field_size,
+            boat.y / self.field_size,
+            boat.heading,
+            boat.speed / 40.0,
+            1.0 if boat.foil else 0.0,
+            local_wind_spd / 25.0,
+            local_wind_dir,
+            dist_to_target / self.field_size,
+            angle_to_target,
+            # --- Dati Nemico ---
+            rel_enemy_x / self.field_size,
+            rel_enemy_y / self.field_size,
+            enemy.heading,
+            enemy.speed / 40.0
         ], dtype=np.float32)
         
         return obs
     
-    def render(self):
-        # Generiamo il frame solo se viene richiesto
-        return render_frame(self)
+    def observation_space(self, agent):
+        return self.observation_spaces[agent]
+
+    def action_space(self, agent):
+        return self.action_spaces[agent]
